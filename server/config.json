@@ -1,0 +1,5 @@
+{
+    "Port": 5555,
+    "FileSystemRootPath": "./webdav_fs",
+    "LogLevel": "debug"
+}
