@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
+	"path"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,9 +18,12 @@ import (
 	"golang.org/x/net/webdav"
 )
 
-var AllWebdavMethods []string = []string{
-	"OPTIONS", "GET", "HEAD", "POST", "DELETE", "PUT", "MKCOL",
-	"COPY", "MOVE", "LOCK", "UNLOCK", "PROPFIND", "PROPPATCH",
+var WebdavMethods []string = []string{
+	"MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "PROPFIND", "PROPPATCH",
+}
+
+var VCWebdavMethods []string = []string{
+	"CHECKIN",
 }
 
 type Config struct {
@@ -28,22 +32,7 @@ type Config struct {
 	ReadTimeoutSeconds  uint32 `config:"read-timeout-seconds"`
 	WriteTimeoutSeconds uint32 `config:"write-timeout-seconds"`
 	IdleTimeoutSeconds  uint32 `config:"idle-timeout-seconds"`
-	AuthAnyway          bool   `config:"auth-anyway"`
 	LogLevel            string `config:"log-level"`
-}
-
-func WebDavWrapper(handler *webdav.Handler) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			for _, method := range AllWebdavMethods {
-				if r.Method == method {
-					handler.ServeHTTP(w, r)
-					return
-				}
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
 }
 
 func main() {
@@ -71,24 +60,32 @@ func main() {
 		return
 	}
 
-	pathRoot := cfg.FileSystemRootPath
-	if err := os.Mkdir(pathRoot, os.ModePerm); !os.IsExist(err) {
+	handlerFSPath, repo, err := InitFs(cfg.FileSystemRootPath, "/root")
+	if err != nil {
 		logger.Panic("Failed to init file system", zap.Error(err))
 	}
 
-	handler := &webdav.Handler{
-		Prefix:     "/",
-		FileSystem: webdav.Dir(pathRoot),
-		LockSystem: webdav.NewMemLS(),
+	handler := &VCHandler{
+		handlerFSPath,
+		repo,
+		sync.Mutex{},
+		webdav.Handler{
+			Prefix:     "/",
+			FileSystem: webdav.Dir(path.Join(cfg.FileSystemRootPath, handlerFSPath)),
+			LockSystem: webdav.NewMemLS(),
+			Logger:     GetHandlerLoggingFunc(),
+		},
 	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(LoggingMiddleware)
-	r.Use(WebDavWrapper(handler))
-	r.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
-		handler.ServeHTTP(w, r)
-	})
+	r.Use(middleware.StripSlashes)
+	for _, method := range append(WebdavMethods, VCWebdavMethods...) {
+		chi.RegisterMethod(method)
+		r.Method(method, "/*", handler)
+	}
+	r.Handle("/*", handler)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),

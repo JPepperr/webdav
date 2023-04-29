@@ -56,3 +56,17 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(handler)
 }
+
+func GetHandlerLoggingFunc() func(*http.Request, error) {
+	return func(r *http.Request, err error) {
+		if err != nil {
+			ctx := r.Context()
+			reqId := middleware.GetReqID(ctx)
+			Logger.With(zap.String("req_id", reqId)).Error(
+				r.URL.Path,
+				zap.String("method", r.Method),
+				zap.Error(err),
+			)
+		}
+	}
+}
