@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"path"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -15,7 +13,6 @@ import (
 	"github.com/heetch/confita/backend/file"
 	"github.com/heetch/confita/backend/flags"
 	"go.uber.org/zap"
-	"golang.org/x/net/webdav"
 )
 
 var WebdavMethods []string = []string{
@@ -23,7 +20,7 @@ var WebdavMethods []string = []string{
 }
 
 var VCWebdavMethods []string = []string{
-	"CHECKIN",
+	"VERSION-CONTROL", "CHECKOUT", "CHECKIN", "UNCHECKOUT",
 }
 
 type Config struct {
@@ -33,6 +30,7 @@ type Config struct {
 	WriteTimeoutSeconds uint32 `config:"write-timeout-seconds"`
 	IdleTimeoutSeconds  uint32 `config:"idle-timeout-seconds"`
 	LogLevel            string `config:"log-level"`
+	CacheSize           int    `config:"cache-size"`
 }
 
 func main() {
@@ -42,6 +40,7 @@ func main() {
 		WriteTimeoutSeconds: 5,
 		IdleTimeoutSeconds:  120,
 		LogLevel:            "info",
+		CacheSize:           512,
 	}
 
 	err := confita.NewLoader(
@@ -60,21 +59,9 @@ func main() {
 		return
 	}
 
-	handlerFSPath, repo, err := InitFs(cfg.FileSystemRootPath, "/root")
+	handler, err := NewHandler(cfg.FileSystemRootPath, "/root", "/vc_root", cfg.CacheSize)
 	if err != nil {
 		logger.Panic("Failed to init file system", zap.Error(err))
-	}
-
-	handler := &VCHandler{
-		handlerFSPath,
-		repo,
-		sync.Mutex{},
-		webdav.Handler{
-			Prefix:     "/",
-			FileSystem: webdav.Dir(path.Join(cfg.FileSystemRootPath, handlerFSPath)),
-			LockSystem: webdav.NewMemLS(),
-			Logger:     GetHandlerLoggingFunc(),
-		},
 	}
 
 	r := chi.NewRouter()

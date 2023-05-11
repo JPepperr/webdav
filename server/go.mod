@@ -32,6 +32,8 @@ require (
 require (
 	github.com/go-chi/chi/v5 v5.0.8
 	github.com/go-git/go-git/v5 v5.6.1
+	github.com/hashicorp/golang-lru v1.0.1
+	github.com/hashicorp/golang-lru/v2 v2.0.2
 	github.com/heetch/confita v0.10.0
 	golang.org/x/net v0.10.0
 )

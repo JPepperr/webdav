@@ -9,66 +9,115 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	lru "github.com/hashicorp/golang-lru/v2"
+	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
 )
 
 type VCHandler struct {
-	fileSystemPath string
-	repo           *git.Repository
-	git_mutex      sync.Mutex
+	fileSystemPath           string
+	versionControlSystemPath string
+	reposCache               *lru.ARCCache[string, *git.Repository]
 	webdav.Handler
 }
 
-func InitFs(pathFS, sevrverPrefix string) (string, *git.Repository, error) {
-	if sevrverPrefix == "" {
-		sevrverPrefix = "/root"
+func NewHandler(rootPath, fSPrefix, vCPrefix string, cacheSize int) (*VCHandler, error) {
+	if fSPrefix == "" {
+		fSPrefix = "/root"
 	}
+	if vCPrefix == "" {
+		vCPrefix = "/vc_root"
+	}
+	fSPath := path.Join(rootPath, fSPrefix)
+	vCPath := path.Join(rootPath, vCPrefix)
+
+	err := os.Mkdir(rootPath, os.ModePerm|os.ModeDir)
+	if err != nil && !os.IsExist(err) {
+		return nil, err
+	}
+
+	err = os.Mkdir(fSPath, os.ModePerm|os.ModeDir)
+	if err != nil && !os.IsExist(err) {
+		return nil, err
+	}
+
+	err = os.Mkdir(vCPath, os.ModePerm|os.ModeDir)
+	if err != nil && !os.IsExist(err) {
+		return nil, err
+	}
+
+	cache, err := lru.NewARC[string, *git.Repository](cacheSize)
+	if err != nil {
+		return nil, err
+	}
+
+	return &VCHandler{
+		fSPath,
+		vCPath,
+		cache,
+		webdav.Handler{
+			Prefix:     "/",
+			FileSystem: webdav.Dir(fSPath),
+			LockSystem: webdav.NewMemLS(),
+			Logger:     GetHandlerLoggingFunc(),
+		},
+	}, nil
+}
+
+func GetVCFileName(path string) string {
+	hasher := md5.New()
+	hasher.Write([]byte(path))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func (h *VCHandler) getRepo(filePath string) (*git.Repository, error) {
+	if cachedValue, ok := h.reposCache.Get(filePath); ok {
+		Logger.Debug("CacheHit", zap.String("resource", filePath))
+		return cachedValue, nil
+	}
+	name := GetVCFileName(filePath)
+	vCDirPath := path.Join(h.versionControlSystemPath, name)
+
 	var repo *git.Repository
-	err := os.Mkdir(pathFS, os.ModePerm|os.ModeDir)
-	serverPath := path.Join(pathFS, sevrverPrefix)
+	err := os.Mkdir(vCDirPath, os.ModePerm|os.ModeDir)
 	if err != nil {
 		if !os.IsExist(err) {
-			return "", nil, err
+			return nil, err
 		}
-		err = os.Mkdir(serverPath, os.ModePerm|os.ModeDir)
-		if err != nil && !os.IsExist(err) {
-			return "", nil, err
-		}
-		repo, err = git.PlainOpen(pathFS)
+		repo, err = git.PlainOpen(vCDirPath)
 	} else {
-		err = os.Mkdir(serverPath, os.ModePerm|os.ModeDir)
+		vCFilePath, err := filepath.Abs(filepath.Join(vCDirPath, defaultVCFileName))
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 
-		repo, err = git.PlainInit(pathFS, false)
+		err = os.Rename(filePath, vCFilePath)
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 
-		initFileName := ".init"
-		_, err = os.Create(path.Join(pathFS, initFileName))
+		repo, err = git.PlainInit(vCDirPath, false)
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 
 		wt, err := repo.Worktree()
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 
 		err = wt.AddWithOptions(&git.AddOptions{
-			Path: initFileName,
+			Path: defaultVCFileName,
 		})
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 
 		_, err = wt.Commit(time.Now().String(), &git.CommitOptions{
@@ -77,25 +126,29 @@ func InitFs(pathFS, sevrverPrefix string) (string, *git.Repository, error) {
 			Author:            getSignature(),
 		})
 		if err != nil {
-			return "", nil, err
+			return nil, err
+		}
+
+		err = os.Symlink(vCFilePath, filePath)
+		if err != nil {
+			return nil, err
 		}
 	}
-
-	return sevrverPrefix, repo, err
-}
-
-func GetBranchName(path string) string {
-	hasher := md5.New()
-	hasher.Write([]byte(path))
-	return hex.EncodeToString(hasher.Sum(nil))
+	Logger.Debug("CacheMiss", zap.String("resource", filePath))
+	h.reposCache.Add(filePath, repo)
+	return repo, err
 }
 
 func (h *VCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	status := http.StatusBadRequest
 	switch r.Method {
-	case "CHECKIN":
-		status, err = h.handleCheckIn(w, r)
+	case "VERSION-CONTROL":
+		status, err = h.handleVersionControl(w, r)
+	case "CHECKOUT":
+		status, err = h.handleCheckout(w, r)
+	case "UNCHECKOUT":
+		status, err = h.handleUncheckout(w, r)
 	default:
 		h.Handler.ServeHTTP(w, r)
 		return
@@ -132,17 +185,19 @@ func findETag(ctx context.Context, name string, fi os.FileInfo) (string, error) 
 	return fmt.Sprintf(`"%x%x"`, fi.ModTime().UnixNano(), fi.Size()), nil
 }
 
-func (h *VCHandler) handleCheckIn(w http.ResponseWriter, r *http.Request) (status int, err error) {
+func (h *VCHandler) handleVersionControl(w http.ResponseWriter, r *http.Request) (status int, err error) {
 	reqPath, status, err := h.stripPrefix(r.URL.Path)
 	if err != nil {
 		return status, err
 	}
+
 	ctx := r.Context()
 	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
 	if err != nil {
 		return http.StatusNotFound, err
 	}
 	defer f.Close()
+
 	fi, err := f.Stat()
 	if err != nil {
 		return http.StatusNotFound, err
@@ -150,71 +205,148 @@ func (h *VCHandler) handleCheckIn(w http.ResponseWriter, r *http.Request) (statu
 	if fi.IsDir() {
 		return http.StatusMethodNotAllowed, nil
 	}
+
 	etag, err := findETag(ctx, reqPath, fi)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 	w.Header().Set("ETag", etag)
 
-	hash, err := h.checkIn(path.Join(h.fileSystemPath, reqPath))
+	hash, err := h.versionControl(path.Join(h.fileSystemPath, reqPath))
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-
 	w.Header().Set("Version", hash)
-
 	return http.StatusCreated, nil
 }
 
-func (h *VCHandler) checkIn(path string) (string, error) {
-	brName := GetBranchName(path)
-	createOption := true
+func (h *VCHandler) handleCheckout(w http.ResponseWriter, r *http.Request) (status int, err error) {
+	reqPath, status, err := h.stripPrefix(r.URL.Path)
+	if err != nil {
+		return status, err
+	}
 
-	h.git_mutex.Lock()
-	defer h.git_mutex.Unlock()
+	ctx := r.Context()
+	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	defer f.Close()
 
-	wt, err := h.repo.Worktree()
+	fi, err := f.Stat()
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	if fi.IsDir() {
+		return http.StatusMethodNotAllowed, nil
+	}
+
+	etag, err := findETag(ctx, reqPath, fi)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	w.Header().Set("ETag", etag)
+
+	err = h.checkout(path.Join(h.fileSystemPath, reqPath), r.Header.Get("Version"))
+	if err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return http.StatusNotAcceptable, err
+		}
+		return http.StatusInternalServerError, err
+	}
+	return http.StatusOK, nil
+}
+
+func (h *VCHandler) handleUncheckout(w http.ResponseWriter, r *http.Request) (status int, err error) {
+	reqPath, status, err := h.stripPrefix(r.URL.Path)
+	if err != nil {
+		return status, err
+	}
+
+	ctx := r.Context()
+	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	if fi.IsDir() {
+		return http.StatusMethodNotAllowed, nil
+	}
+
+	etag, err := findETag(ctx, reqPath, fi)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	w.Header().Set("ETag", etag)
+
+	err = h.uncheckout(path.Join(h.fileSystemPath, reqPath))
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	return http.StatusOK, nil
+}
+
+func (h *VCHandler) versionControl(path string) (string, error) {
+	repo, err := h.getRepo(path)
 	if err != nil {
 		return "", err
 	}
 
-	_, err = h.repo.Storer.Reference(plumbing.NewBranchReferenceName(brName))
-	if err == nil {
-		createOption = false
+	hashRef, err := repo.Head()
+	if err != nil {
+		return "", err
 	}
+
+	return hashRef.Hash().String(), nil
+}
+
+func (h *VCHandler) checkout(path, version string) error {
+	repo, err := h.getRepo(path)
+	if err != nil {
+		return err
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	bhash, err := repo.ResolveRevision(plumbing.Revision(version))
+	if err != nil {
+		return err
+	}
+
 	err = wt.Checkout(&git.CheckoutOptions{
-		Branch: plumbing.NewBranchReferenceName(brName),
-		Create: createOption,
-		Keep:   true,
+		Hash:   *bhash,
+		Create: false,
+		Force:  true,
 	})
+
+	return err
+}
+
+func (h *VCHandler) uncheckout(path string) error {
+	repo, err := h.getRepo(path)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	err = wt.AddWithOptions(&git.AddOptions{
-		Path: path,
-	})
+	wt, err := repo.Worktree()
 	if err != nil {
-		return "", err
-	}
-
-	hash, err := wt.Commit(time.Now().String(), &git.CommitOptions{
-		All:               true,
-		AllowEmptyCommits: true,
-		Author:            getSignature(),
-	})
-	if err != nil {
-		return "", err
+		return err
 	}
 
 	err = wt.Checkout(&git.CheckoutOptions{
-		Keep: true,
+		Create: false,
+		Force:  true,
 	})
-	if err != nil {
-		return "", err
-	}
 
-	return hash.String(), nil
+	return err
 }
 
 func getSignature() *object.Signature {
@@ -227,4 +359,6 @@ func getSignature() *object.Signature {
 
 var (
 	errPrefixMismatch = errors.New("webdav: prefix mismatch")
+
+	defaultVCFileName = "init"
 )
