@@ -143,11 +143,13 @@ func (h *VCHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	status := http.StatusBadRequest
 	switch r.Method {
-	case "VERSION-CONTROL":
+	case MethodVersionControl:
 		status, err = h.handleVersionControl(w, r)
-	case "CHECKOUT":
+	case MethodCheckout:
 		status, err = h.handleCheckout(w, r)
-	case "UNCHECKOUT":
+	case MethodCheckin:
+		status, err = h.handleCheckin(w, r)
+	case MethodUncheckout:
 		status, err = h.handleUncheckout(w, r)
 	default:
 		h.Handler.ServeHTTP(w, r)
@@ -185,72 +187,59 @@ func findETag(ctx context.Context, name string, fi os.FileInfo) (string, error) 
 	return fmt.Sprintf(`"%x%x"`, fi.ModTime().UnixNano(), fi.Size()), nil
 }
 
-func (h *VCHandler) handleVersionControl(w http.ResponseWriter, r *http.Request) (status int, err error) {
-	reqPath, status, err := h.stripPrefix(r.URL.Path)
+func (h *VCHandler) checkFile(w http.ResponseWriter, r *http.Request) (reqPath string, status int, err error) {
+	reqPath, status, err = h.stripPrefix(r.URL.Path)
 	if err != nil {
-		return status, err
+		return
 	}
 
 	ctx := r.Context()
 	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
 	if err != nil {
-		return http.StatusNotFound, err
+		return "", http.StatusNotFound, err
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return http.StatusNotFound, err
+		return "", http.StatusNotFound, err
 	}
 	if fi.IsDir() {
-		return http.StatusMethodNotAllowed, nil
+		return "", http.StatusMethodNotAllowed, errInvalidMethodForDir
 	}
 
 	etag, err := findETag(ctx, reqPath, fi)
 	if err != nil {
-		return http.StatusInternalServerError, err
+		return "", http.StatusInternalServerError, err
 	}
 	w.Header().Set("ETag", etag)
 
+	return reqPath, http.StatusOK, nil
+}
+
+func (h *VCHandler) handleVersionControl(w http.ResponseWriter, r *http.Request) (status int, err error) {
+	reqPath, status, err := h.checkFile(w, r)
+	if err != nil {
+		return
+	}
 	hash, err := h.versionControl(path.Join(h.fileSystemPath, reqPath))
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 	w.Header().Set("Version", hash)
-	return http.StatusCreated, nil
+	return http.StatusOK, nil
 }
 
 func (h *VCHandler) handleCheckout(w http.ResponseWriter, r *http.Request) (status int, err error) {
-	reqPath, status, err := h.stripPrefix(r.URL.Path)
+	reqPath, status, err := h.checkFile(w, r)
 	if err != nil {
-		return status, err
+		return
 	}
-
-	ctx := r.Context()
-	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
-	if err != nil {
-		return http.StatusNotFound, err
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		return http.StatusNotFound, err
-	}
-	if fi.IsDir() {
-		return http.StatusMethodNotAllowed, nil
-	}
-
-	etag, err := findETag(ctx, reqPath, fi)
-	if err != nil {
-		return http.StatusInternalServerError, err
-	}
-	w.Header().Set("ETag", etag)
 
 	err = h.checkout(path.Join(h.fileSystemPath, reqPath), r.Header.Get("Version"))
 	if err != nil {
 		if errors.Is(err, plumbing.ErrReferenceNotFound) {
-			return http.StatusNotAcceptable, err
+			return http.StatusNotAcceptable, nil
 		}
 		return http.StatusInternalServerError, err
 	}
@@ -258,37 +247,34 @@ func (h *VCHandler) handleCheckout(w http.ResponseWriter, r *http.Request) (stat
 }
 
 func (h *VCHandler) handleUncheckout(w http.ResponseWriter, r *http.Request) (status int, err error) {
-	reqPath, status, err := h.stripPrefix(r.URL.Path)
+	reqPath, status, err := h.checkFile(w, r)
 	if err != nil {
-		return status, err
+		return
 	}
-
-	ctx := r.Context()
-	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
-	if err != nil {
-		return http.StatusNotFound, err
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		return http.StatusNotFound, err
-	}
-	if fi.IsDir() {
-		return http.StatusMethodNotAllowed, nil
-	}
-
-	etag, err := findETag(ctx, reqPath, fi)
-	if err != nil {
-		return http.StatusInternalServerError, err
-	}
-	w.Header().Set("ETag", etag)
 
 	err = h.uncheckout(path.Join(h.fileSystemPath, reqPath))
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 	return http.StatusOK, nil
+}
+
+func (h *VCHandler) handleCheckin(w http.ResponseWriter, r *http.Request) (status int, err error) {
+	reqPath, status, err := h.checkFile(w, r)
+	if err != nil {
+		return
+	}
+
+	hash, err := h.checkin(path.Join(h.fileSystemPath, reqPath))
+	if err != nil {
+		if errors.Is(err, errNeedUncheckout) {
+			w.Header().Set("Allow", http.MethodGet+", "+MethodUncheckout+", "+MethodVersionControl)
+			return http.StatusMethodNotAllowed, nil
+		}
+		return http.StatusInternalServerError, err
+	}
+	w.Header().Set("Version", hash)
+	return http.StatusCreated, nil
 }
 
 func (h *VCHandler) versionControl(path string) (string, error) {
@@ -349,6 +335,45 @@ func (h *VCHandler) uncheckout(path string) error {
 	return err
 }
 
+func (h *VCHandler) checkin(path string) (string, error) {
+	repo, err := h.getRepo(path)
+	if err != nil {
+		return "", err
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		return "", err
+	}
+
+	ref, err := repo.Head()
+	if err != nil {
+		return "", err
+	}
+
+	if ref.Name() != plumbing.Master {
+		return "", errNeedUncheckout
+	}
+
+	err = wt.AddWithOptions(&git.AddOptions{
+		Path: defaultVCFileName,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	hash, err := wt.Commit(time.Now().String(), &git.CommitOptions{
+		All:               true,
+		AllowEmptyCommits: false,
+		Author:            getSignature(),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return hash.String(), nil
+}
+
 func getSignature() *object.Signature {
 	return &object.Signature{
 		Name:  "root",
@@ -358,7 +383,14 @@ func getSignature() *object.Signature {
 }
 
 var (
-	errPrefixMismatch = errors.New("webdav: prefix mismatch")
+	MethodVersionControl = "VERSION-CONTROL"
+	MethodCheckout       = "CHECKOUT"
+	MethodCheckin        = "CHECKIN"
+	MethodUncheckout     = "UNCHECKOUT"
+
+	errPrefixMismatch      = errors.New("webdav: prefix mismatch")
+	errInvalidMethodForDir = errors.New("webdav: method not allowed for collection")
+	errNeedUncheckout      = errors.New("webdav: cannot checkin from checkouted version")
 
 	defaultVCFileName = "init"
 )

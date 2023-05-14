@@ -20,7 +20,7 @@ var WebdavMethods []string = []string{
 }
 
 var VCWebdavMethods []string = []string{
-	"VERSION-CONTROL", "CHECKOUT", "CHECKIN", "UNCHECKOUT",
+	MethodVersionControl, MethodCheckout, MethodCheckin, MethodUncheckout,
 }
 
 type Config struct {
