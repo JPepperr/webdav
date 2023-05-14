@@ -187,6 +187,34 @@ func findETag(ctx context.Context, name string, fi os.FileInfo) (string, error) 
 	return fmt.Sprintf(`"%x%x"`, fi.ModTime().UnixNano(), fi.Size()), nil
 }
 
+func (h *VCHandler) lock(now time.Time, root string) (token string, err error) {
+	token, err = h.LockSystem.Create(now, webdav.LockDetails{
+		Root:      root,
+		Duration:  -1,
+		ZeroDepth: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (h *VCHandler) checkLocks(r *http.Request, path string) (release func(), err error) {
+	now, token := time.Now(), ""
+	if path != "" {
+		token, err = h.lock(now, path)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return func() {
+		if token != "" {
+			h.LockSystem.Unlock(now, token)
+		}
+	}, nil
+}
+
 func (h *VCHandler) checkFile(w http.ResponseWriter, r *http.Request) (reqPath string, status int, err error) {
 	reqPath, status, err = h.stripPrefix(r.URL.Path)
 	if err != nil {
@@ -236,6 +264,15 @@ func (h *VCHandler) handleCheckout(w http.ResponseWriter, r *http.Request) (stat
 		return
 	}
 
+	release, err := h.checkLocks(r, reqPath)
+	if err != nil {
+		if err == webdav.ErrLocked {
+			return webdav.StatusLocked, nil
+		}
+		return http.StatusInternalServerError, err
+	}
+	defer release()
+
 	err = h.checkout(path.Join(h.fileSystemPath, reqPath), r.Header.Get("Version"))
 	if err != nil {
 		if errors.Is(err, plumbing.ErrReferenceNotFound) {
@@ -252,6 +289,15 @@ func (h *VCHandler) handleUncheckout(w http.ResponseWriter, r *http.Request) (st
 		return
 	}
 
+	release, err := h.checkLocks(r, reqPath)
+	if err != nil {
+		if err == webdav.ErrLocked {
+			return webdav.StatusLocked, nil
+		}
+		return http.StatusInternalServerError, err
+	}
+	defer release()
+
 	err = h.uncheckout(path.Join(h.fileSystemPath, reqPath))
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -264,6 +310,15 @@ func (h *VCHandler) handleCheckin(w http.ResponseWriter, r *http.Request) (statu
 	if err != nil {
 		return
 	}
+
+	release, err := h.checkLocks(r, reqPath)
+	if err != nil {
+		if err == webdav.ErrLocked {
+			return webdav.StatusLocked, nil
+		}
+		return http.StatusInternalServerError, err
+	}
+	defer release()
 
 	hash, err := h.checkin(path.Join(h.fileSystemPath, reqPath))
 	if err != nil {
