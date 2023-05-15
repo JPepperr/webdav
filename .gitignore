@@ -1,5 +1,5 @@
 **/webdav_fs
 **/.vscode
 lock.xml
-main
-proppatch.xml
+webdavvc
+*.test
